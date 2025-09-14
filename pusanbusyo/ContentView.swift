@@ -2301,20 +2301,29 @@ final class MapVM: ObservableObject {
         }
     }
 
-    // ⬇️ 교체
+    // MapVM
     private func refreshBusesOnly() async {
         if isRefreshing { return }
         isRefreshing = true
         defer { isRefreshing = false }
 
-        // 새 에폭
         epochCounter &+= 1
         let epoch = epochCounter
 
-        let top = computeTopArrivals(allArrivals: latestTopArrivals,  // 이미 ArrivalInfo 배열
+        // 기존 상위 노선
+        var top = computeTopArrivals(allArrivals: latestTopArrivals,
                                      followedRouteNo: (followBusId.flatMap { routeNoById[$0] }))
-        guard !top.isEmpty else { return }
 
+        // ★ 팔로우 중이면 해당 노선을 항상 포함 (도착정보 상위에서 빠져도 계속 조회)
+        if let fid = followBusId,
+           let rno = routeNoById[fid],
+           let rid = resolveRouteId(for: rno),
+           top.first(where: { $0.routeId == rid }) == nil {
+
+            top.append(ArrivalInfo(routeId: rid, routeNo: rno, etaMinutes: 5)) // ETA 더미
+        }
+
+        guard !top.isEmpty else { return }
 
         let snap = makeRouteSnapshot()
         let etaByRoute = Dictionary(uniqueKeysWithValues: top.map { ($0.routeNo, $0.etaMinutes) })
@@ -2322,10 +2331,12 @@ final class MapVM: ObservableObject {
 
         do {
             try await withThrowingTaskGroup(of: [BusLive].self) { group in
-                for a in top { group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) } }
+                for a in top {
+                    group.addTask { try await self.api.fetchBusLocations(cityCode: CITY_CODE, routeId: a.routeId) }
+                }
                 while let arr = try await group.next() {
                     let enriched = arr.map { var m = $0; m.etaMinutes = etaByRoute[m.routeNo]; return m }
-                    let filtered = self.mergeAndFilter(enriched, snap: snap) // 👈 동일
+                    let filtered = self.mergeAndFilter(enriched, snap: snap)
                     for b in filtered { self.routeNoById[b.id] = b.routeNo; mergedById[b.id] = b }
                     self.ensureFollowGhost(&mergedById)
                     applyIfCurrent(epoch: epoch) {
@@ -2334,7 +2345,30 @@ final class MapVM: ObservableObject {
                 }
             }
         } catch { /* 무음 */ }
+
+        // ★ 팔로우 대상 재획득(사라졌다면 같은 노선에서 가장 가까운 버스로 스위칭)
+        if let fid = followBusId,
+           self.buses.first(where: { $0.id == fid }) == nil,
+           let rno = routeNoById[fid] {
+
+            let cand = self.buses
+                .filter { $0.routeNo == rno }
+                .min { lhs, rhs in
+                    let a = CLLocation(latitude: lhs.lat, longitude: lhs.lon)
+                    let b = CLLocation(latitude: rhs.lat, longitude: rhs.lon)
+                    let last = tracks[fid]?.lastLoc
+                    guard let last else { return false }
+                    let la = CLLocation(latitude: last.latitude, longitude: last.longitude)
+                    return la.distance(from: a) < la.distance(from: b)
+                }
+
+            if let c = cand { followBusId = c.id } // 자연스러운 재연결
+        }
     }
+
+    
+    
+    
 
     
     private var lastPassedStopIndex: [String: Int] = [:]
@@ -2402,37 +2436,58 @@ final class MapVM: ObservableObject {
         busRouteIdByBusId[busId] = routeId
         return idx
     }
+    // MapVM 내부 어디든 private helper로 추가
+    private func compoundBusId(routeId: String, rawVehId: String) -> String {
+        return "\(routeId)#\(rawVehId)"
+    }
 
     // MapVM 안에 있던 기존 함수 정의를 이걸로 교체
+    // MapVM
     private func mergeAndFilter(_ incoming: [BusLive], snap: RouteSnapshot) -> [BusLive] {
         var out: [BusLive] = []
 
-        // 튜닝 파라미터
+        // 튜닝(기존 값 유지)
         let LATERAL_MAX_M: Double = 60
         let PASS_GATE_M: Double   = 18
         let SPEED_FLOOR_MPS: Double = 1.5
         let NEAR_STOP_M: Double   = 25
-        let MAX_STEP_M: Double    = 700
+        let MAX_STEP_M: Double    = 300
         let EMA_ALPHA: Double     = 0.35
-        let MAX_PLAUSIBLE_MPS: Double = 50.0
-        let FOLLOW_STEP_ALLOW_METERS: CLLocationDistance = 2000
+        let MAX_PLAUSIBLE_MPS: Double = 40.0
+        let FOLLOW_STEP_ALLOW_METERS: CLLocationDistance = 1200
 
         for var b in incoming {
             let now = Date()
             let rawC = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
-            let isFollowed = (followBusId == b.id)
+
+            // ★ 합성 ID 만들기 (routeId가 꼭 필요)
+            guard let rid = resolveRouteId(for: b.routeNo) else { continue }
+            let cid = compoundBusId(routeId: rid, rawVehId: b.id)  // ← "routeId#vehicleno"
+
+            // ★ 새 BusLive로 재구성(Struct라 id 변경 불가)
+            var bus = BusLive(
+                id: cid,
+                routeNo: b.routeNo,
+                lat: b.lat,
+                lon: b.lon,
+                etaMinutes: b.etaMinutes,
+                nextStopName: b.nextStopName
+            )
+
+            let isFollowed = (followBusId == bus.id)
 
             // 1) 트랙 준비
-            if tracks[b.id] == nil {
-                tracks[b.id] = BusTrack(prevLoc: nil, prevAt: nil, lastLoc: rawC, lastAt: now)
-                out.append(b)
+            let nowC = CLLocationCoordinate2D(latitude: bus.lat, longitude: bus.lon)
+            if tracks[bus.id] == nil {
+                tracks[bus.id] = BusTrack(prevLoc: nil, prevAt: nil, lastLoc: nowC, lastAt: now)
+                out.append(bus)
                 continue
             }
-            var tr = tracks[b.id]!
+            var tr = tracks[bus.id]!
 
             // 2) 점프/EMA
             let step = CLLocation(latitude: tr.lastLoc.latitude, longitude: tr.lastLoc.longitude)
-                .distance(from: CLLocation(latitude: rawC.latitude, longitude: rawC.longitude))
+                .distance(from: CLLocation(latitude: nowC.latitude, longitude: nowC.longitude))
             let dt = max(0.01, now.timeIntervalSince(tr.lastAt))
             let instMps = step / dt
 
@@ -2442,114 +2497,104 @@ final class MapVM: ObservableObject {
                 else if instMps <= MAX_PLAUSIBLE_MPS { acceptAsJump = true }
             }
             if step > MAX_STEP_M && !acceptAsJump {
-                out.append(b); continue
+                out.append(bus); continue
             }
 
             let alpha = acceptAsJump ? 0.9 : EMA_ALPHA
             let smooth = CLLocationCoordinate2D(
-                latitude:  tr.lastLoc.latitude  * (1 - alpha) + rawC.latitude  * alpha,
-                longitude: tr.lastLoc.longitude * (1 - alpha) + rawC.longitude * alpha
+                latitude:  tr.lastLoc.latitude  * (1 - alpha) + nowC.latitude  * alpha,
+                longitude: tr.lastLoc.longitude * (1 - alpha) + nowC.longitude * alpha
             )
             tr.prevLoc = tr.lastLoc
             tr.prevAt  = tr.lastAt
             tr.lastLoc = smooth
             tr.lastAt  = now
             tr.updateKinematics()
-            tracks[b.id] = tr
+            tracks[bus.id] = tr
 
             // 3) 메타/사영
-            guard let rid = resolveRouteId(for: b.routeNo),
-                  let meta = snap.metaById[rid],
+            guard let meta = snap.metaById[rid],
                   let rStops = snap.stopsByRouteId[rid],
                   let prj = projectOnRoute(smooth, shape: meta.shape, cumul: meta.cumul)
             else {
                 // 메타 없음 → coast
                 let pred = tr.coastPredict(at: now.addingTimeInterval(0.6),
                                            decay: COAST_DECAY_PER_SEC, minSpeed: COAST_MIN_SPEED)
-                b.lat = pred.latitude
-                b.lon = pred.longitude
-                if let prev = lastETAMinByBusId[b.id] { b.etaMinutes = prev }
+                bus.lat = pred.latitude
+                bus.lon = pred.longitude
+                if let prev = lastETAMinByBusId[bus.id] { bus.etaMinutes = prev }
 
-                // 트레일만 기록
-                if followBusId == b.id {
-                    let c = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
+                if followBusId == bus.id {
+                    let c = CLLocationCoordinate2D(latitude: bus.lat, longitude: bus.lon)
                     trail.appendIfNeeded(c); trailVersion &+= 1
                 }
-                out.append(b)
+                out.append(bus)
                 continue
             }
 
-            // 오프루트 → 무시
             if prj.lateral > LATERAL_MAX_M {
-                if let prev = lastETAMinByBusId[b.id] { b.etaMinutes = prev }
-                if followBusId == b.id {
-                    let c = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
+                if let prev = lastETAMinByBusId[bus.id] { bus.etaMinutes = prev }
+                if followBusId == bus.id {
+                    let c = CLLocationCoordinate2D(latitude: bus.lat, longitude: bus.lon)
                     trail.appendIfNeeded(c); trailVersion &+= 1
                 }
-                out.append(b)
+                out.append(bus)
                 continue
             }
 
             // 경로 위로 클램프
-            b.lat = prj.snapped.latitude
-            b.lon = prj.snapped.longitude
+            bus.lat = prj.snapped.latitude
+            bus.lon = prj.snapped.longitude
 
-            // 4) 다음 정류장 인덱스
+            // 4) 다음 정류장 인덱스/ETA
             let stopS = meta.stopS
             let count = min(stopS.count, rStops.count)
-            guard count > 0 else { out.append(b); continue }
+            guard count > 0 else { out.append(bus); continue }
 
-            var passed = lastPassedStopIndex[b.id] ?? -1
+            var passed = lastPassedStopIndex[bus.id] ?? -1
             while passed + 1 < count && (prj.s - stopS[passed + 1]) >= PASS_GATE_M {
                 passed += 1
             }
-            if let last = lastPassedStopIndex[b.id] { passed = max(passed, last) }
-            lastPassedStopIndex[b.id] = passed
+            if let last = lastPassedStopIndex[bus.id] { passed = max(passed, last) }
+            lastPassedStopIndex[bus.id] = passed
 
             let nextIdx = min(passed + 1, count - 1)
             let nextStop = rStops[nextIdx]
-            b.nextStopName = nextStop.name
+            bus.nextStopName = nextStop.name
 
-            // 5) ETA
             let remaining = max(0, stopS[nextIdx] - prj.s)
             let vObs = max(0.1, tr.speedMps)
             let vForETA = max(SPEED_FLOOR_MPS, vObs)
             var sec = Int(remaining / vForETA)
             if vObs < 1.2 && remaining < NEAR_STOP_M { sec = 0 }
             let rawETA = max(0, Int((Double(sec)/60.0).rounded(.toNearestOrEven)))
-
-            if let e = smoothETA(rawETA: rawETA, busId: b.id, distToNextStop: remaining) {
-                b.etaMinutes = e
-                lastETAMinByBusId[b.id] = e
-            } else if let prev = lastETAMinByBusId[b.id] {
-                b.etaMinutes = prev
+            if let e = smoothETA(rawETA: rawETA, busId: bus.id, distToNextStop: remaining) {
+                bus.etaMinutes = e
+                lastETAMinByBusId[bus.id] = e
+            } else if let prev = lastETAMinByBusId[bus.id] {
+                bus.etaMinutes = prev
             }
 
-            // 6) 스냅
-            maybeSnapToStop(&b)
+            // 스냅
+            maybeSnapToStop(&bus)
 
-            // ▶ 팔로우 중: 트레일 + 하이라이트 + 미래경로
-           
-            // ▶ 팔로우 중: 트레일 + 하이라이트 + 미래경로
-            if followBusId == b.id {
-                let c = CLLocationCoordinate2D(latitude: b.lat, longitude: b.lon)
+            // 팔로우 중: 트레일/하이라이트/미래경로
+            if followBusId == bus.id {
+                let c = CLLocationCoordinate2D(latitude: bus.lat, longitude: bus.lon)
                 trail.appendIfNeeded(c); trailVersion &+= 1
-
-                // 다음 정류장 하이라이트
                 highlightedStopId = nextStop.id
-
-                // ⬇️ 정류장 단위로 빨간 라인 갱신
                 setFutureRouteByStops(meta: meta, from: prj, nextIdx: nextIdx, maxAheadStops: 7, includeTerminal: false)
             }
 
-
-
-            out.append(b)
+            out.append(bus)
         }
 
         return out
     }
 
+    
+    
+    
     // MapVM 내부 (private helpers 섹션에)
     private func buildFutureRouteStopByStop(
         meta: RouteMeta,
